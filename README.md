@@ -1,7 +1,5 @@
 # CamRush
 
-Lightweight camera-powered browser arcade.
+Four fast camera-controlled browser games: Catch Rush, Face Dodge, Smile Blast and Hand Pong.
 
-Features: local camera processing, lazy computer vision loading, PWA support, responsive UI, and three starter games: Catch It, Dodge Rush, Reaction Rush.
-
-Development: npm install, then npm run dev. Production: npm run build. Camera access requires HTTPS or localhost.
+Camera processing is local to the browser and there is no upload or account system. Vision code loads only when a game starts. Vite uses a relative base for GitHub Pages.
