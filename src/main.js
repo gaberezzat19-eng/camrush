@@ -1,7 +1,9 @@
 import './style.css';
 
 const app=document.querySelector('#app');
-const state={cv:null,stream:null,video:null,game:null,raf:0,score:0,best:Number(localStorage.getItem('camrush-best')||0)};
+const state={cv:null,stream:null,video:null,tracker:null,game:null,raf:0,score:0,best:Number(localStorage.getItem('camrush-best')||0)};
+const VISION_VERSION='0.10.21';
+const VISION_CDN='https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@'+VISION_VERSION;
 const games=[
 {id:'catch',icon:'✦',title:'Catch Rush',tag:'HAND',desc:'Catch glowing targets with your index finger.',color:'cyan',time:'45 SEC'},
 {id:'dodge',icon:'◉',title:'Face Dodge',tag:'FACE',desc:'Lean left and right to dodge falling gates.',color:'violet',time:'ENDLESS'},
@@ -17,21 +19,119 @@ let deferredInstall=null;
 window.addEventListener('beforeinstallprompt',e=>{e.preventDefault();deferredInstall=e;document.querySelector('#installBtn').hidden=false});
 document.querySelector('#installBtn').onclick=async()=>{if(deferredInstall){deferredInstall.prompt();await deferredInstall.userChoice;deferredInstall=null}};
 function toast(m){const t=document.querySelector('#toast');t.textContent=m;t.classList.remove('hidden');clearTimeout(toast.timer);toast.timer=setTimeout(()=>t.classList.add('hidden'),3000)}
-async function loadVision(){if(state.cv)return state.cv;state.cv=await import('https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.22/+esm');return state.cv}
-async function startCamera(){if(state.stream)stopCamera();state.stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:'user',width:{ideal:960},height:{ideal:540}},audio:false});state.video=document.querySelector('#camera');state.video.srcObject=state.stream;await state.video.play()}
-function stopCamera(){if(state.stream){state.stream.getTracks().forEach(t=>t.stop());state.stream=null}}
+async function loadVision(){
+ if(state.cv)return state.cv;
+ state.cv=await import(VISION_CDN+'/+esm');
+ return state.cv
+}
+async function startCamera(){
+ if(!window.isSecureContext)throw new Error('CAMERA_INSECURE_CONTEXT');
+ if(!navigator.mediaDevices?.getUserMedia)throw new Error('CAMERA_API_UNAVAILABLE');
+ if(state.stream)stopCamera();
+ let stream;
+ try{
+  stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:'user'},width:{ideal:960},height:{ideal:540}},audio:false});
+ }catch(e){
+  if(e?.name==='OverconstrainedError')stream=await navigator.mediaDevices.getUserMedia({video:true,audio:false});
+  else throw e;
+ }
+ state.stream=stream;
+ state.video=document.querySelector('#camera');
+ state.video.srcObject=stream;
+ state.video.muted=true;
+ state.video.playsInline=true;
+ await new Promise((resolve,reject)=>{
+  if(state.video.readyState>=1)return resolve();
+  const ok=()=>{cleanup();resolve()};
+  const bad=()=>{cleanup();reject(new Error('CAMERA_METADATA_FAILED'))};
+  const cleanup=()=>{state.video.removeEventListener('loadedmetadata',ok);state.video.removeEventListener('error',bad)};
+  state.video.addEventListener('loadedmetadata',ok,{once:true});
+  state.video.addEventListener('error',bad,{once:true});
+ });
+ await state.video.play();
+}
+function stopCamera(){
+ if(state.stream){state.stream.getTracks().forEach(t=>t.stop());state.stream=null}
+ if(state.video)state.video.srcObject=null;
+}
 function countdown(){return new Promise(res=>{const e=document.querySelector('#countdown');e.classList.remove('hidden');let n=3;e.textContent=n;const t=setInterval(()=>{n--;if(n<=0){clearInterval(t);e.classList.add('hidden');res()}else e.textContent=n},600)})}
 function addScore(n){state.score+=n||1;document.querySelector('#gameScore').textContent=state.score;if(state.score>state.best){state.best=state.score;localStorage.setItem('camrush-best',state.best);document.querySelector('#bestScore').textContent=state.best}}
-function finish(){cancelAnimationFrame(state.raf);stopCamera();document.querySelector('#gameStatus').textContent='ROUND OVER • '+state.score+' POINTS';document.querySelector('#gameTip').textContent='Hit RESTART to play again.'}
-async function openGame(id){state.game=id;state.score=0;document.querySelector('#gameModal').classList.remove('hidden');const m=games.find(x=>x.id===id);document.querySelector('#gameTitle').textContent=m.title;document.querySelector('#gameTag').textContent=m.tag;document.querySelector('#gameScore').textContent='0';document.querySelector('#gameStatus').textContent='LOADING';document.querySelector('#gameTip').textContent=(id==='catch'||id==='pong')?'Show one hand • move naturally':'Keep your face in frame • move naturally';const l=document.querySelector('#loading');l.classList.remove('hidden');try{await startCamera();await loadVision();await countdown();startEngine(id)}catch(e){console.error(e);l.innerHTML='<b>Camera access is needed</b><small>Allow camera permission and try again.</small>';toast('Camera permission was not available.')}}
-document.querySelector('#closeGame').onclick=()=>{cancelAnimationFrame(state.raf);stopCamera();document.querySelector('#gameModal').classList.add('hidden')};
+function disposeTracker(){
+ if(state.tracker){
+  try{state.tracker.close()}catch{}
+  state.tracker=null;
+ }
+}
+function finish(){
+ cancelAnimationFrame(state.raf);
+ disposeTracker();
+ stopCamera();
+ document.querySelector('#gameStatus').textContent='ROUND OVER • '+state.score+' POINTS';
+ document.querySelector('#gameTip').textContent='Hit RESTART to play again.';
+}
+function errorText(e){
+ const n=e?.name||'Error';
+ if(n==='NotAllowedError')return 'Camera permission was denied or blocked by browser policy.';
+ if(n==='NotFoundError')return 'No camera was found on this device.';
+ if(n==='NotReadableError')return 'The camera is busy or unavailable to this browser.';
+ if(n==='OverconstrainedError')return 'The selected camera settings are not supported.';
+ if(n==='SecurityError'||n==='CAMERA_INSECURE_CONTEXT')return 'Camera requires a secure HTTPS page.';
+ if(n==='CAMERA_API_UNAVAILABLE')return 'This browser does not provide camera access.';
+ if(n==='CAMERA_METADATA_FAILED')return 'The camera opened but did not provide video frames.';
+ return 'The vision engine could not start: '+(e?.message||n);
+}
+async function openGame(id){
+ cancelAnimationFrame(state.raf);
+ disposeTracker();
+ stopCamera();
+ state.game=id;
+ state.score=0;
+ document.querySelector('#gameModal').classList.remove('hidden');
+ const m=games.find(x=>x.id===id);
+ document.querySelector('#gameTitle').textContent=m.title;
+ document.querySelector('#gameTag').textContent=m.tag;
+ document.querySelector('#gameScore').textContent='0';
+ document.querySelector('#gameStatus').textContent='LOADING';
+ document.querySelector('#gameTip').textContent=(id==='catch'||id==='pong')?'Show one hand • move naturally':'Keep your face in frame • move naturally';
+ const l=document.querySelector('#loading');
+ l.innerHTML='<div class="spinner"></div><b>Waking the camera…</b><small>Allow camera access to play.</small>';
+ l.classList.remove('hidden');
+ try{
+  await startCamera();
+  await loadVision();
+  await countdown();
+  await startEngine(id);
+ }catch(e){
+  console.error('CamRush startup error',e);
+  cancelAnimationFrame(state.raf);
+  disposeTracker();
+  stopCamera();
+  l.innerHTML='<b>Could not start the game</b><small>'+errorText(e)+'</small>';
+  document.querySelector('#gameStatus').textContent='STARTUP ERROR';
+  document.querySelector('#gameTip').textContent='Fix the message above, then press RESTART.';
+  toast(errorText(e));
+ }
+}
+document.querySelector('#closeGame').onclick=()=>{cancelAnimationFrame(state.raf);disposeTracker();stopCamera();document.querySelector('#gameModal').classList.add('hidden')};
 document.querySelector('#restartGame').onclick=()=>state.game&&openGame(state.game);
 document.querySelector('#playBtn').onclick=()=>openGame('catch');
 grid.onclick=e=>{const c=e.target.closest('[data-game]');if(c)openGame(c.dataset.game)};
 
 function canvas(){const c=document.querySelector('#gameCanvas'),r=c.parentElement.getBoundingClientRect(),d=Math.min(devicePixelRatio||1,2);c.width=r.width*d;c.height=r.height*d;c.style.width=r.width+'px';c.style.height=r.height+'px';const x=c.getContext('2d');x.setTransform(d,0,0,d,0,0);return{x,w:r.width,h:r.height}}
 function drawVideo(x,w,h){const v=state.video;if(!v||v.readyState<2)return;x.save();x.scale(-1,1);x.drawImage(v,-w,0,w,h);x.restore();x.fillStyle='rgba(4,7,15,.28)';x.fillRect(0,0,w,h)}
-async function tracker(type){const {FilesetResolver,HandLandmarker,FaceLandmarker}=state.cv;const fs=await FilesetResolver.forVisionTasks('https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.22/wasm');const path=type==='hand'?'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task':'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task';const o={baseOptions:{modelAssetPath:path},runningMode:'VIDEO',minFaceDetectionConfidence:.5,minTrackingConfidence:.5};return type==='hand'?HandLandmarker.createFromOptions(fs,{...o,numHands:1,minHandDetectionConfidence:.5}):FaceLandmarker.createFromOptions(fs,{...o,numFaces:1,outputFaceBlendshapes:type==='smile'})}
+async function tracker(type){
+ disposeTracker();
+ const {FilesetResolver,HandLandmarker,FaceLandmarker}=state.cv;
+ const fs=await FilesetResolver.forVisionTasks(VISION_CDN+'/wasm');
+ const path=type==='hand'
+  ?'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task'
+  :'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task';
+ const o={baseOptions:{modelAssetPath:path},runningMode:'VIDEO',minFaceDetectionConfidence:.5,minTrackingConfidence:.5};
+ state.tracker=type==='hand'
+  ?await HandLandmarker.createFromOptions(fs,{...o,numHands:1,minHandDetectionConfidence:.5})
+  :await FaceLandmarker.createFromOptions(fs,{...o,numFaces:1,outputFaceBlendshapes:type==='smile'});
+ return state.tracker;
+}
 
 async function gameCatch(){const {x,w,h}=canvas(),tr=await tracker('hand');let ts=[],last=0,end=performance.now()+45000;document.querySelector('#gameStatus').textContent='CATCH THE GLOW';function loop(now){if(now>end){finish();return}const r=tr.detectForVideo(state.video,now);drawVideo(x,w,h);if(now-last>650){last=now;ts.push({x:Math.random()*.8+.1,y:Math.random()*.65+.18,r:22+Math.random()*13,b:now})}const p=r.landmarks?.[0]?.[8];let px=-1e3,py=-1e3;if(p){px=(1-p.x)*w;py=p.y*h;x.beginPath();x.arc(px,py,9,0,7);x.strokeStyle='#fff';x.lineWidth=3;x.stroke()}ts=ts.filter(t=>now-t.b<1200);for(const t of ts){x.beginPath();x.arc(t.x*w,t.y*h,t.r,0,7);x.fillStyle='rgba(103,232,249,.15)';x.fill();x.strokeStyle='#67e8f9';x.lineWidth=3;x.stroke();if(Math.hypot(px-t.x*w,py-t.y*h)<t.r+15){addScore();t.b=0;t.r=0}}x.fillStyle='#fff';x.font='700 14px system-ui';x.fillText('TIME '+Math.ceil((end-now)/1000)+'s',18,28);state.raf=requestAnimationFrame(loop)}loop(performance.now())}
 async function gameDodge(){const {x,w,h}=canvas(),tr=await tracker('face');let px=w/2,obs=[],last=0,start=performance.now(),survive=0;document.querySelector('#gameStatus').textContent='DODGE THE GATES';function loop(now){const r=tr.detectForVideo(state.video,now);drawVideo(x,w,h);const f=r.faceLandmarks?.[0]?.[1];if(f)px+=(1-f.x)*w-px;px=Math.max(35,Math.min(w-35,px));if(now-last>850){last=now;const gap=115+Math.random()*55;obs.push({y:-35,gx:45+Math.random()*(w-gap-90),gap})}for(const o of obs)o.y+=3.2+Math.min(4,(now-start)/12000);obs=obs.filter(o=>o.y<h+60);for(const o of obs){x.fillStyle='#a78bfa';x.fillRect(0,o.y,o.gx,25);x.fillRect(o.gx+o.gap,o.y,w-o.gx-o.gap,25);if(o.y>h*.72&&o.y<h*.72+25&&(px<o.gx+22||px>o.gx+o.gap-22)){finish();return}}if(Math.floor((now-start)/1000)>survive){survive++;addScore()}x.beginPath();x.arc(px,h*.78,18,0,7);x.fillStyle='#fff';x.fill();x.strokeStyle='#a78bfa';x.lineWidth=5;x.stroke();x.fillStyle='#fff';x.font='700 14px system-ui';x.fillText('SURVIVE '+survive+'s',18,28);state.raf=requestAnimationFrame(loop)}loop(performance.now())}
